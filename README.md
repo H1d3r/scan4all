@@ -10,6 +10,9 @@
    <a href="/static/NicePwn.md">Best Practices</a>
 </p>
 
+# Use channel 51pwn to communicate with me
+https://chat.51pwn.com:2083/
+
 # Features
 
 <h1 align="center">
