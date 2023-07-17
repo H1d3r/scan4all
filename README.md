@@ -11,7 +11,7 @@
 </p>
 
 # Use channel 51pwn to communicate with me
-https://chat.51pwn.com:2083/
+https://chat.51pwn.com/
 
 # Features
 
