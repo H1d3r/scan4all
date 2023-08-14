@@ -10,8 +10,7 @@
    <a href="/static/NicePwn.md">Best Practices</a>
 </p>
 
-# Use channel 51pwn to communicate with me
-https://chat.51pwn.com/
+# <a href="https://chat.51pwn.com:2083/?cnId=51pwn&atRd=true&sdMsg=%E6%9C%89%E4%BA%8B%E5%8F%AF%E4%BB%A5%E8%BF%99%E9%87%8C%E8%81%8A%E5%A4%A9%EF%BC%8C%E8%BF%99%E9%87%8C%E6%98%AF%E5%85%A8%E5%8C%BF%E5%90%8D%EF%BC%8C%E5%AE%89%E5%85%A8%E8%81%8A%E5%A4%A9%E7%B3%BB%E7%BB%9F%EF%BC%8C%E4%B8%8D%E5%8F%97%E7%9B%91%E7%AE%A1%E7%9A%84&stChat=1" target=_black>chat with me online</a>
 
 # Features
 
