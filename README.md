@@ -174,7 +174,7 @@ priorityNmap=false ./scan4all -tp http -list allOut.txt -v
 more see: <a href=https://github.com/hktalent/scan4all/discussions>discussions</a>
 
 # Thanks
-- Thanks to @freeload101 and other friends for their donations and support for this project
+- Thanks to <a href=https://github.com/freeload101 target=_black>@freeload101</a> and other friends for their donations and support for this project
 
 # Changelog
 - 2023-05-21 给nuclei提出演进的思路https://github.com/projectdiscovery/nuclei/issues/3720 包含nuclei扫描的防御思路
