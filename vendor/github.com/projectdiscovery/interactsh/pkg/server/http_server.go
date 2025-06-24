@@ -3,20 +3,23 @@ package server
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/projectdiscovery/gologger"
-	"github.com/projectdiscovery/stringsutil"
+	stringsutil "github.com/projectdiscovery/utils/strings"
 )
 
 // HTTPServer is a http server instance that listens both
@@ -62,16 +65,18 @@ func NewHTTPServer(options *Options) (*HTTPServer, error) {
 	if options.HTTPIndex != "" {
 		abs, _ := filepath.Abs(options.HTTPDirectory)
 		gologger.Info().Msgf("Using custom server index: %s", abs)
-		if data, err := ioutil.ReadFile(options.HTTPIndex); err == nil {
+		if data, err := os.ReadFile(options.HTTPIndex); err == nil {
 			server.customBanner = string(data)
 		}
 	}
 	router := &http.ServeMux{}
-	router.Handle("/", server.logger(http.HandlerFunc(server.defaultHandler)))
+	router.Handle("/", server.logger(server.corsMiddleware(http.HandlerFunc(server.defaultHandler))))
 	router.Handle("/register", server.corsMiddleware(server.authMiddleware(http.HandlerFunc(server.registerHandler))))
 	router.Handle("/deregister", server.corsMiddleware(server.authMiddleware(http.HandlerFunc(server.deregisterHandler))))
 	router.Handle("/poll", server.corsMiddleware(server.authMiddleware(http.HandlerFunc(server.pollHandler))))
-	router.Handle("/metrics", server.corsMiddleware(server.authMiddleware(http.HandlerFunc(server.metricsHandler))))
+	if server.options.EnableMetrics {
+		router.Handle("/metrics", server.corsMiddleware(server.authMiddleware(http.HandlerFunc(server.metricsHandler))))
+	}
 	server.tlsserver = http.Server{Addr: options.ListenIP + fmt.Sprintf(":%d", options.HttpsPort), Handler: router, ErrorLog: log.New(&noopLogger{}, "", 0)}
 	server.nontlsserver = http.Server{Addr: options.ListenIP + fmt.Sprintf(":%d", options.HttpPort), Handler: router, ErrorLog: log.New(&noopLogger{}, "", 0)}
 	return server, nil
@@ -104,7 +109,7 @@ func (h *HTTPServer) logger(handler http.Handler) http.HandlerFunc {
 		req, _ := httputil.DumpRequest(r, true)
 		reqString := string(req)
 
-		gologger.Debug().Msgf("New HTTP request: %s\n", reqString)
+		gologger.Debug().Msgf("New HTTP request: \n\n%s\n", reqString)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, r)
 
@@ -186,7 +191,6 @@ func (h *HTTPServer) logger(handler http.Handler) http.HandlerFunc {
 func (h *HTTPServer) handleInteraction(uniqueID, fullID, reqString, respString, hostPort string) {
 	correlationID := uniqueID[:h.options.CorrelationIdLength]
 
-	// host, _, _ := net.SplitHostPort(hostPort)
 	interaction := &Interaction{
 		Protocol:      "http",
 		UniqueID:      uniqueID,
@@ -217,11 +221,13 @@ If you notice any interactions from <b>*.%s</b> in your logs, it's possible that
 You should investigate the sites where these interactions were generated from, and if a vulnerability exists, examine the root cause and take the necessary steps to mitigate the issue.
 `
 
-// defaultHandler is a handler for default collaborator requests
-func (h *HTTPServer) defaultHandler(w http.ResponseWriter, req *http.Request) {
-	reflection := h.options.URLReflection(req.Host)
-	// use first domain as default (todo: should be extracted from certificate)
+func extractServerDomain(h *HTTPServer, req *http.Request) string {
+	if h.options.HeaderServer != "" {
+		return h.options.HeaderServer
+	}
+
 	var domain string
+	// use first domain as default (todo: should be extracted from certificate)
 	if len(h.options.Domains) > 0 {
 		// attempts to extract the domain name from host header
 		for _, configuredDomain := range h.options.Domains {
@@ -235,10 +241,41 @@ func (h *HTTPServer) defaultHandler(w http.ResponseWriter, req *http.Request) {
 			domain = h.options.Domains[0]
 		}
 	}
-	w.Header().Set("Server", domain)
-	w.Header().Set("X-Interactsh-Version", h.options.Version)
+	return domain
+}
 
+// defaultHandler is a handler for default collaborator requests
+func (h *HTTPServer) defaultHandler(w http.ResponseWriter, req *http.Request) {
+	atomic.AddUint64(&h.options.Stats.Http, 1)
+
+	domain := extractServerDomain(h, req)
+	w.Header().Set("Server", domain)
+	if !h.options.NoVersionHeader {
+		w.Header().Set("X-Interactsh-Version", h.options.Version)
+	}
+
+	reflection := h.options.URLReflection(req.Host)
 	if stringsutil.HasPrefixI(req.URL.Path, "/s/") && h.staticHandler != nil {
+		if h.options.DynamicResp && len(req.URL.Query()) > 0 {
+			values := req.URL.Query()
+			if headers := values["header"]; len(headers) > 0 {
+				for _, header := range headers {
+					if headerParts := strings.SplitN(header, ":", 2); len(headerParts) == 2 {
+						w.Header().Add(headerParts[0], headerParts[1])
+					}
+				}
+			}
+			if delay := values.Get("delay"); delay != "" {
+				if parsed, err := strconv.Atoi(delay); err == nil {
+					time.Sleep(time.Duration(parsed) * time.Second)
+				}
+			}
+			if status := values.Get("status"); status != "" {
+				if parsed, err := strconv.Atoi(status); err == nil {
+					w.WriteHeader(parsed)
+				}
+			}
+		}
 		h.staticHandler.ServeHTTP(w, req)
 	} else if req.URL.Path == "/" && reflection == "" {
 		if h.customBanner != "" {
@@ -255,7 +292,56 @@ func (h *HTTPServer) defaultHandler(w http.ResponseWriter, req *http.Request) {
 		fmt.Fprintf(w, "<data>%s</data>", reflection)
 		w.Header().Set("Content-Type", "application/xml")
 	} else {
+		if h.options.DynamicResp && (len(req.URL.Query()) > 0 || stringsutil.HasPrefixI(req.URL.Path, "/b64_body:")) {
+			writeResponseFromDynamicRequest(w, req)
+			return
+		}
 		fmt.Fprintf(w, "<html><head></head><body>%s</body></html>", reflection)
+	}
+}
+
+// writeResponseFromDynamicRequest writes a response to http.ResponseWriter
+// based on dynamic data from HTTP URL Query parameters.
+//
+// The following parameters are supported -
+//
+//	body (response body)
+//	header (response header)
+//	status (response status code)
+//	delay (response time)
+func writeResponseFromDynamicRequest(w http.ResponseWriter, req *http.Request) {
+	values := req.URL.Query()
+
+	if stringsutil.HasPrefixI(req.URL.Path, "/b64_body:") {
+		firstindex := strings.Index(req.URL.Path, "/b64_body:")
+		lastIndex := strings.LastIndex(req.URL.Path, "/")
+
+		decodedBytes, _ := base64.StdEncoding.DecodeString(req.URL.Path[firstindex+10 : lastIndex])
+		_, _ = w.Write(decodedBytes)
+
+	}
+	if headers := values["header"]; len(headers) > 0 {
+		for _, header := range headers {
+			if headerParts := strings.SplitN(header, ":", 2); len(headerParts) == 2 {
+				w.Header().Add(headerParts[0], headerParts[1])
+			}
+		}
+	}
+	if delay := values.Get("delay"); delay != "" {
+		parsed, _ := strconv.Atoi(delay)
+		time.Sleep(time.Duration(parsed) * time.Second)
+	}
+	if status := values.Get("status"); status != "" {
+		parsed, _ := strconv.Atoi(status)
+		w.WriteHeader(parsed)
+	}
+	if body := values.Get("body"); body != "" {
+		_, _ = w.Write([]byte(body))
+	}
+
+	if b64_body := values.Get("b64_body"); b64_body != "" {
+		decodedBytes, _ := base64.StdEncoding.DecodeString(string([]byte(b64_body)))
+		_, _ = w.Write(decodedBytes)
 	}
 }
 
@@ -278,6 +364,8 @@ func (h *HTTPServer) registerHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	atomic.AddInt64(&h.options.Stats.Sessions, 1)
+
 	if err := h.options.Storage.SetIDPublicKey(r.CorrelationID, r.SecretKey, r.PublicKey); err != nil {
 		gologger.Warning().Msgf("Could not set id and public key for %s: %s\n", r.CorrelationID, err)
 		jsonError(w, fmt.Sprintf("could not set id and public key: %s", err), http.StatusBadRequest)
@@ -297,6 +385,8 @@ type DeregisterRequest struct {
 
 // deregisterHandler is a handler for client deregister requests
 func (h *HTTPServer) deregisterHandler(w http.ResponseWriter, req *http.Request) {
+	atomic.AddInt64(&h.options.Stats.Sessions, -1)
+
 	r := &DeregisterRequest{}
 	if err := jsoniter.NewDecoder(req.Body).Decode(r); err != nil {
 		gologger.Warning().Msgf("Could not decode json body: %s\n", err)
@@ -345,8 +435,13 @@ func (h *HTTPServer) pollHandler(w http.ResponseWriter, req *http.Request) {
 	var tlddata, extradata []string
 	if h.options.RootTLD {
 		for _, domain := range h.options.Domains {
-			tlddata, _ = h.options.Storage.GetInteractionsWithId(domain)
+			interactions, _ := h.options.Storage.GetInteractionsWithId(domain)
+			// root domains interaction are not encrypted
+			tlddata = append(tlddata, interactions...)
 		}
+	}
+	if h.options.Token != "" {
+		// auth token interactions are not encrypted
 		extradata, _ = h.options.Storage.GetInteractionsWithId(h.options.Token)
 	}
 	response := &PollResponse{Data: data, AESKey: aesKey, TLDData: tlddata, Extra: extradata}
@@ -407,9 +502,13 @@ func (h *HTTPServer) checkToken(req *http.Request) bool {
 
 // metricsHandler is a handler for /metrics endpoint
 func (h *HTTPServer) metricsHandler(w http.ResponseWriter, req *http.Request) {
-	metrics := h.options.Storage.GetCacheMetrics()
+	interactMetrics := h.options.Stats
+	interactMetrics.Cache = GetCacheMetrics(h.options)
+	interactMetrics.Cpu = GetCpuMetrics()
+	interactMetrics.Memory = GetMemoryMetrics()
+	interactMetrics.Network = GetNetworkMetrics()
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	_ = jsoniter.NewEncoder(w).Encode(metrics)
+	_ = jsoniter.NewEncoder(w).Encode(interactMetrics)
 }
