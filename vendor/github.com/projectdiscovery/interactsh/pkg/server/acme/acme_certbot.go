@@ -3,6 +3,7 @@ package acme
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,12 +21,17 @@ func CleanupStorage() {
 	certmagic.CleanStorage(context.Background(), certmagic.Default.Storage, cleanupOptions)
 }
 
+type CertificateFiles struct {
+	CertPath    string
+	PrivKeyPath string
+}
+
 // HandleWildcardCertificates handles ACME wildcard cert generation with DNS
 // challenge using certmagic library from caddyserver.
-func HandleWildcardCertificates(domain, email string, store *Provider, debug bool) ([]tls.Certificate, error) {
+func HandleWildcardCertificates(domain, email string, store *Provider, debug bool) ([]tls.Certificate, []CertificateFiles, error) {
 	logger, err := zap.NewProduction()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	certmagic.DefaultACME.Agreed = true
 	certmagic.DefaultACME.Email = email
@@ -55,22 +61,20 @@ func HandleWildcardCertificates(domain, email string, store *Provider, debug boo
 	var creating bool
 	if !certAlreadyExists(cfg, &certmagic.DefaultACME, domain) {
 		creating = true
-		gologger.Info().Msgf("Requesting SSL Certificate for:  [%s, %s]", domain, strings.TrimPrefix(domain, "*."))
+		gologger.Info().Msgf("Requesting SSL Certificate for:  [%s, %s]", domain, originalDomain)
 	} else {
-		gologger.Info().Msgf("Loading existing SSL Certificate for:  [%s, %s]", domain, strings.TrimPrefix(domain, "*."))
+		gologger.Info().Msgf("Loading existing SSL Certificate for:  [%s, %s]", domain, originalDomain)
 	}
 
 	// this obtains certificates or renews them if necessary
-	if syncerr := cfg.ObtainCertSync(context.Background(), domain); syncerr != nil {
-		return nil, syncerr
+	if syncErr := cfg.ObtainCertSync(context.Background(), domain); syncErr != nil {
+		return nil, nil, syncErr
 	}
+
 	domains := []string{domain, originalDomain}
-	go func() {
-		syncerr := cfg.ManageAsync(context.Background(), domains)
-		if syncerr != nil {
-			gologger.Error().Msgf("Could not manageasync certmagic certs: %s", err)
-		}
-	}()
+	if syncErr := cfg.ManageSync(context.Background(), domains); syncErr != nil {
+		gologger.Error().Msgf("Could not manage certmagic certs: %s", syncErr)
+	}
 
 	if creating {
 		home, _ := os.UserHomeDir()
@@ -78,28 +82,42 @@ func HandleWildcardCertificates(domain, email string, store *Provider, debug boo
 	}
 
 	// attempts to extract certificates from caddy
-	var certs []tls.Certificate
+	var (
+		certs     []tls.Certificate
+		certFiles []CertificateFiles
+	)
 	for _, domain := range domains {
-		var retried bool
+		var retried, retriedWildcard bool
 	retry_cert:
-		certPath, privKeyPath, err := extractCaddyPaths(cfg, &certmagic.DefaultACME, domain)
+		certPath, privKeyPath, err := ExtractCaddyPaths(cfg, &certmagic.DefaultACME, domain)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		certFiles = append(certFiles, CertificateFiles{CertPath: certPath, PrivKeyPath: privKeyPath})
 		cert, err := tls.LoadX509KeyPair(certPath, privKeyPath)
-		if err != nil && !retried {
-			retried = true
-			// wait I/O to sync
-			time.Sleep(5 * time.Second)
-			goto retry_cert
+		if err != nil {
+			if !retried {
+				retried = true
+				// wait I/O to sync
+				time.Sleep(5 * time.Second)
+				goto retry_cert
+			}
+			if !retriedWildcard {
+				retriedWildcard = true
+				// wait I/O to sync
+				time.Sleep(5 * time.Second)
+				// attempt to load the domain as wildcard
+				domain = fmt.Sprintf("wildcard_.%s", domain)
+				goto retry_cert
+			}
 		}
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		certs = append(certs, cert)
 	}
 
-	return certs, nil
+	return certs, certFiles, nil
 }
 
 // certAlreadyExists returns true if a cert already exists
@@ -113,8 +131,8 @@ func certAlreadyExists(cfg *certmagic.Config, issuer certmagic.Issuer, domain st
 		cfg.Storage.Exists(context.Background(), metaKey)
 }
 
-// extractCaddyPaths attempts to extract cert and private key through the layers of abstractions from the domain name
-func extractCaddyPaths(cfg *certmagic.Config, issuer certmagic.Issuer, domain string) (certPath, privKeyPath string, err error) {
+// ExtractCaddyPaths attempts to extract cert and private key through the layers of abstractions from the domain name
+func ExtractCaddyPaths(cfg *certmagic.Config, issuer certmagic.Issuer, domain string) (certPath, privKeyPath string, err error) {
 	issuerKey := issuer.IssuerKey()
 	certId := certmagic.StorageKeys.SiteCert(issuerKey, domain)
 	keyId := certmagic.StorageKeys.SitePrivateKey(issuerKey, domain)
@@ -130,7 +148,7 @@ func extractCaddyPaths(cfg *certmagic.Config, issuer certmagic.Issuer, domain st
 	return
 }
 
-// BuildTlsConfig with certificates
+// BuildTlsConfigWithCertAndKeyPaths Build TlsConfig with certificates
 func BuildTlsConfigWithCertAndKeyPaths(certPath, privKeyPath, domain string) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(certPath, privKeyPath)
 	if err != nil {
@@ -139,8 +157,11 @@ func BuildTlsConfigWithCertAndKeyPaths(certPath, privKeyPath, domain string) (*t
 	return BuildTlsConfigWithCerts(domain, cert)
 }
 
-// BuildTlsConfigWithExistingConfig with existing certificates
+// BuildTlsConfigWithCerts Build TlsConfig with existing certificates
 func BuildTlsConfigWithCerts(domain string, certs ...tls.Certificate) (*tls.Config, error) {
+	if certs == nil {
+		return nil, errors.New("no certificates provided")
+	}
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
 		Certificates:       certs,
